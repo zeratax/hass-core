@@ -5,6 +5,7 @@ from collections.abc import Callable
 from datetime import datetime, timedelta
 import logging
 from typing import Any
+from enum import Enum
 
 from pyasuswrt import AsusWrtError
 
@@ -14,16 +15,17 @@ from homeassistant.components.device_tracker import (
     DOMAIN as TRACKER_DOMAIN,
 )
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.components.switch import SwitchEntity
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.device_registry import DeviceInfo, format_mac
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.event import async_track_time_interval
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+from homeassistant.helpers.update_coordinator import CoordinatorEntity, DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util, slugify
 
-from .bridge import AsusWrtBridge, WrtDevice
+from .bridge import AsusWrtBridge, WrtDevice, WrtVpnClient
 from .const import (
     CONF_DNSMASQ,
     CONF_INTERFACE,
@@ -37,6 +39,7 @@ from .const import (
     KEY_METHOD,
     KEY_SENSORS,
     SENSORS_CONNECTED_DEVICE,
+    AsusWrtVpnState
 )
 
 CONF_REQ_RELOAD = [CONF_DNSMASQ, CONF_INTERFACE, CONF_REQUIRE_IP]
@@ -151,6 +154,46 @@ class AsusWrtDevInfo:
         return self._last_activity
 
 
+class AsusWrtVpnInfo():
+    """Representation of a AsusWrt vpn client info."""
+    def __init__(self, id: str, description: str | None = None, state: AsusWrtVpnState = AsusWrtVpnState.OFF):
+        """Initialize a AsusWrt vpn client info."""
+        self._id = id
+        self._description = description
+        self._state = state
+
+    def update(self, vpn_info: WrtVpnClient) -> None:
+        """Update AsusWrt vpn client info."""
+        self._description = vpn_info.description
+        self._state = vpn_info.state
+
+    def turn_on(self) -> None:
+        self._state = AsusWrtVpnState.STARTING
+
+    def turn_off(self) -> None:
+        self._state = AsusWrtVpnState.OFF
+
+    @property
+    def is_on(self) -> bool:
+        """Return if the vpn client is on."""
+        return self._state == AsusWrtVpnState.ON
+
+    @property
+    def state(self) -> str:
+        """Return the state of the vpn client."""
+        return str(self._state)
+
+    @property
+    def id(self) -> str:
+        """Return the id of the vpn client."""
+        return self._id
+
+    @property
+    def description(self) -> str:
+        """Returns the description of the vpn client"""
+        return self._description or ""
+
+
 class AsusWrtRouter:
     """Representation of a AsusWrt router."""
 
@@ -162,6 +205,8 @@ class AsusWrtRouter:
         self._devices: dict[str, AsusWrtDevInfo] = {}
         self._connected_devices: int = 0
         self._connect_error: bool = False
+
+        self._vpn_clients: dict[str, AsusWrtVpnInfo] = {}
 
         self._sensors_data_handler: AsusWrtSensorDataHandler | None = None
         self._sensors_coordinator: dict[str, Any] = {}
@@ -259,6 +304,9 @@ class AsusWrtRouter:
         # Update devices
         await self.update_devices()
 
+        # Update vpn clients
+        await self.update_vpn_clients()
+
         # Init Sensors
         await self.init_sensors_coordinator()
 
@@ -269,6 +317,7 @@ class AsusWrtRouter:
     async def update_all(self, now: datetime | None = None) -> None:
         """Update all AsusWrt platforms."""
         await self.update_devices()
+        await self.update_vpn_clients()
 
     async def update_devices(self) -> None:
         """Update AsusWrt devices tracker."""
@@ -314,6 +363,40 @@ class AsusWrtRouter:
         if new_device:
             async_dispatcher_send(self.hass, self.signal_device_new)
         await self._update_unpolled_sensors()
+
+    async def update_vpn_clients(self):
+        """Fetch list of VPN clients and update/create switches accordingly."""
+        new_vpn_client = False
+        _LOGGER.debug("Checking vpn clients for ASUS router %s", self.host)
+        try:
+            vpn_clients = await self._api.get_vpn_clients()
+        except UpdateFailed as exc:
+            if not self._connect_error:
+                self._connect_error = True
+                _LOGGER.error(
+                    "Error connecting to ASUS router %s for vpn client update: %s",
+                    self.host,
+                    exc,
+                )
+            return
+
+        if self._connect_error:
+            self._connect_error = False
+            _LOGGER.info("Reconnected to ASUS router %s", self.host)
+
+        for vpn_id, vpn_client in self._vpn_clients.items():
+            vpn_info = vpn_clients.pop(vpn_id, None)
+            vpn_client.update(vpn_info)
+
+        for vpn_id, vpn_info in vpn_clients.items():
+            new_vpn_client = True
+            vpn_client = AsusWrtVpnInfo(vpn_id)
+            vpn_client.update(vpn_info)
+            self._vpn_clients[vpn_id] = vpn_client
+
+        async_dispatcher_send(self.hass, self.signal_vpn_client_update)
+        if new_vpn_client:
+            async_dispatcher_send(self.hass, self.signal_vpn_client_new)
 
     async def init_sensors_coordinator(self) -> None:
         """Init AsusWrt sensors coordinators."""
@@ -389,6 +472,14 @@ class AsusWrtRouter:
 
         return info
 
+    async def start_vpn_client(self, id: str) -> None:
+        """Start a vpn client."""
+        await self._api.async_start_vpn_client(id)
+
+    async def stop_vpn_client(self, id: str) -> None:
+        """Stop a vpn client."""
+        await self._api.async_stop_vpn_client(id)
+
     @property
     def signal_device_new(self) -> str:
         """Event specific per AsusWrt entry to signal new device."""
@@ -397,6 +488,16 @@ class AsusWrtRouter:
     @property
     def signal_device_update(self) -> str:
         """Event specific per AsusWrt entry to signal updates in devices."""
+        return f"{DOMAIN}-device-update"
+
+    @property
+    def signal_vpn_client_new(self) -> str:
+        """Event specific per AsusWrt entry to signal new vpn client."""
+        return f"{DOMAIN}-device-new"
+
+    @property
+    def signal_vpn_client_update(self) -> str:
+        """Event specific per AsusWrt entry to signal updates in vpn clients."""
         return f"{DOMAIN}-device-update"
 
     @property
@@ -413,6 +514,11 @@ class AsusWrtRouter:
     def devices(self) -> dict[str, AsusWrtDevInfo]:
         """Return devices."""
         return self._devices
+
+    @property
+    def vpn_clients(self) -> dict[str, AsusWrtVpnInfo]:
+        """Return devices."""
+        return self._vpn_clients
 
     @property
     def sensors_coordinator(self) -> dict[str, Any]:

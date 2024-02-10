@@ -43,6 +43,10 @@ from .const import (
     SENSORS_RATES,
     SENSORS_TEMPERATURES,
     SENSORS_TEMPERATURES_LEGACY,
+    VPN_CLIENT_STATE_OFF,
+    VPN_CLIENT_STATE_ON,
+    VPN_CLIENT_STATE_STARTING,
+    AsusWrtVpnState,
 )
 
 SENSORS_TYPE_BYTES = "sensors_bytes"
@@ -52,6 +56,8 @@ SENSORS_TYPE_RATES = "sensors_rates"
 SENSORS_TYPE_TEMPERATURES = "sensors_temperatures"
 
 WrtDevice = namedtuple("WrtDevice", ["ip", "name", "connected_to"])
+
+WrtVpnClient = namedtuple("WrtVpnClient", ["description", "state"])
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -152,6 +158,18 @@ class AsusWrtBridge(ABC):
         """Get list of connected devices."""
 
     @abstractmethod
+    async def async_get_vpn_clients(self) -> dict[str, WrtVpnClient]:
+        """Get list of vpn clients."""
+
+    @abstractmethod
+    async def async_start_vpn_client(self, id: str) -> None:
+        """Start a vpn client."""
+
+    @abstractmethod
+    async def async_stop_vpn_client(self, id: str) -> None:
+        """Stop a vpn client."""
+
+    @abstractmethod
     async def async_get_available_sensors(self) -> dict[str, dict[str, Any]]:
         """Return a dictionary of available sensors for this bridge."""
 
@@ -219,6 +237,36 @@ class AsusWrtLegacyBridge(AsusWrtBridge):
             format_mac(mac): WrtDevice(dev.ip, dev.name, None)
             for mac, dev in api_devices.items()
         }
+
+    async def async_get_vpn_clients(self) -> dict[str, WrtVpnClient]:
+        """Get list of vpn clients."""
+        raw_vpn_clients = await self._api.async_get_vpn_clients()
+        vpn_clients = {}
+
+        for client in raw_vpn_clients:
+            id = str(client["id"])
+            description = client["description"]
+
+            if client["state"] == VPN_CLIENT_STATE_OFF:
+                state = AsusWrtVpnState.OFF
+            elif client["state"] == VPN_CLIENT_STATE_STARTING:
+                state = AsusWrtVpnState.STARTING
+            elif client["state"] == VPN_CLIENT_STATE_ON:
+                state = AsusWrtVpnState.ON
+            else:
+                raise ValueError(f"Invalid state {client["state"]} for vpn client {id}")
+
+            vpn_clients[id] = WrtVpnClient(description, state)
+
+        return vpn_clients
+
+    async def async_start_vpn_client(self, id: int | str) -> None:
+        """Start a vpn client."""
+        await self._api.async_start_vpn_client(id)
+
+    async def async_stop_vpn_client(self, id: int | str) -> None:
+        """Stop a vpn client."""
+        await self._api.async_stop_vpn_client(id)
 
     async def _get_nvram_info(self, info_type: str) -> dict[str, Any]:
         """Get AsusWrt router info from nvram."""
@@ -351,6 +399,18 @@ class AsusWrtHttpBridge(AsusWrtBridge):
             format_mac(mac): WrtDevice(dev.ip, dev.name, dev.node)
             for mac, dev in api_devices.items()
         }
+
+    async def async_get_vpn_clients(self) -> dict[str, WrtVpnClient]:
+        """Unimplemented."""
+        return {}
+
+    async def async_start_vpn_client(self, id: str) -> None:
+        """Unimplemented."""
+        raise NotImplementedError
+
+    async def async_stop_vpn_client(self, id: str) -> None:
+        """Unimplemented."""
+        raise NotImplementedError
 
     async def async_get_available_sensors(self) -> dict[str, dict[str, Any]]:
         """Return a dictionary of available sensors for this bridge."""

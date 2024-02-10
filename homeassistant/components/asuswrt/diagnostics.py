@@ -45,6 +45,7 @@ async def async_get_config_entry_diagnostics(
         **async_redact_data(attr.asdict(hass_device), TO_REDACT_DEV),
         "entities": {},
         "tracked_devices": [],
+        "switches": [],
     }
 
     hass_entities = er.async_entries_for_device(
@@ -79,6 +80,15 @@ async def async_get_config_entry_diagnostics(
                 "name": device.name or "Unknown device",
                 "ip_address": device.ip_address,
                 "last_activity": device.last_activity,
+            }
+        )
+
+    for vpn_client in router.vpn_clients.values():
+        data["device"]["switches"].append(
+            {
+                "id": vpn_client.id,
+                "description": vpn_client.description,
+                "state": vpn_client.state,
             }
         )
 
